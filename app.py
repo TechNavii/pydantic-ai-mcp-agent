@@ -62,12 +62,27 @@ def get_model() -> OpenAIModel:
     llm = os.getenv('MODEL_CHOICE', 'gpt-4o-mini')
     base_url = os.getenv('BASE_URL', 'https://api.openai.com/v1')
     api_key = os.getenv('LLM_API_KEY', 'no-api-key-provided')
+    provider = os.getenv('PROVIDER', 'openai').lower()
+
+    # Default headers
+    headers = {}
+    
+    # Check if using OpenRouter
+    if 'openrouter' in base_url.lower():
+        logger.info("OpenRouter detected, adding specific headers")
+        # Add OpenRouter specific headers
+        headers = {
+            "HTTP-Referer": "https://localhost:8000",  # Your site URL
+            "X-Title": "Pydantic AI MCP Agent"  # Your site name
+        }
+        logger.debug(f"Using OpenRouter headers: {headers}")
 
     logger.info(f"Using model: {llm} with base URL: {base_url}")
     return OpenAIModel(
         llm,
         base_url=base_url,
-        api_key=api_key
+        api_key=api_key,
+        extra_headers=headers
     )
 
 async def get_pydantic_ai_agent() -> tuple[mcp_client.MCPClient, Agent]:
