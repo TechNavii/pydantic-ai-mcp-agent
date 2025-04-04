@@ -45,6 +45,7 @@ class ConfigUpdate(BaseModel):
     base_url: str
     api_key: str
     model_choice: str
+    http_referer: Optional[str] = None
 
 app = FastAPI(title="Pydantic AI MCP Chat API")
 
@@ -63,13 +64,20 @@ def get_model() -> OpenAIModel:
     base_url = os.getenv('BASE_URL', 'https://api.openai.com/v1')
     api_key = os.getenv('LLM_API_KEY', 'no-api-key-provided')
     provider = os.getenv('PROVIDER', 'openai').lower()
+    http_referer = os.getenv('HTTP_REFERER', 'https://pydantic-ai-mcp-agent.com')
 
     # Check if using OpenRouter
     if 'openrouter' in base_url.lower():
         logger.info("OpenRouter detected - using OpenRouter format for API")
+        
+        # Set OpenRouter required headers via environment variables
+        # These will be picked up by the underlying OpenAI client
+        os.environ['OPENAI_API_TYPE'] = 'openrouter'
+        os.environ['OPENAI_ORGANIZATION'] = http_referer  # Use as HTTP referer
+        
         # For OpenRouter, we need to modify the model name to include the provider prefix
-        # if it's not already included
-        if '/' not in llm and not llm.startswith('openai/'):
+        # if it's not already included and it's an OpenAI model reference
+        if '/' not in llm:
             llm = f"openai/{llm}"
             logger.info(f"Modified model name for OpenRouter: {llm}")
 
@@ -277,7 +285,8 @@ async def get_config():
         return {
             "base_url": os.getenv('BASE_URL', 'https://api.openai.com/v1'),
             "api_key": os.getenv('LLM_API_KEY', ''),
-            "model_choice": os.getenv('MODEL_CHOICE', 'gpt-4o-mini')
+            "model_choice": os.getenv('MODEL_CHOICE', 'gpt-4o-mini'),
+            "http_referer": os.getenv('HTTP_REFERER', 'https://pydantic-ai-mcp-agent.com')
         }
     except Exception as e:
         logger.error(f"Error reading configuration: {e}", exc_info=True)
@@ -295,6 +304,10 @@ async def update_config(config: ConfigUpdate):
         set_key(env_path, 'BASE_URL', config.base_url)
         set_key(env_path, 'LLM_API_KEY', config.api_key)
         set_key(env_path, 'MODEL_CHOICE', config.model_choice)
+        
+        # Save HTTP_REFERER if provided
+        if config.http_referer:
+            set_key(env_path, 'HTTP_REFERER', config.http_referer)
 
         # Reload environment variables
         load_dotenv(override=True)

@@ -484,6 +484,7 @@ class ChatApp {
                 document.getElementById('base-url').value = config.base_url || '';
                 document.getElementById('api-key').value = config.api_key || '';
                 document.getElementById('model-choice').value = config.model_choice || 'gpt-4o-mini';
+                document.getElementById('http-referer').value = config.http_referer || '';
             }
         } catch (error) {
             console.error('Error loading configuration:', error);
@@ -496,7 +497,8 @@ class ChatApp {
         const config = {
             base_url: formData.get('base-url'),
             api_key: formData.get('api-key'),
-            model_choice: formData.get('model-choice')
+            model_choice: formData.get('model-choice'),
+            http_referer: formData.get('http-referer')
         };
 
         try {

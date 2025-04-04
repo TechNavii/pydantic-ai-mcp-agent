@@ -81,6 +81,11 @@
                             <input type="text" id="model-choice" name="model-choice" placeholder="e.g., gpt-4o-mini, anthropic/claude-3-sonnet" required>
                             <small>Enter the model identifier exactly as needed by your provider</small>
                         </div>
+                        <div class="form-group">
+                            <label for="http-referer">HTTP Referer (For OpenRouter):</label>
+                            <input type="url" id="http-referer" name="http-referer" placeholder="e.g., https://yourdomain.com">
+                            <small>Required when using OpenRouter to comply with their terms of service</small>
+                        </div>
                         <div class="form-actions">
                             <button type="submit" class="primary-button">Save Changes</button>
                             <button type="button" class="secondary-button" id="cancel-config">Cancel</button>
