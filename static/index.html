@@ -78,11 +78,8 @@
                         </div>
                         <div class="form-group">
                             <label for="model-choice">Model:</label>
-                            <select id="model-choice" name="model-choice" required>
-                                <option value="gpt-4o-mini">GPT-4 Mini</option>
-                                <option value="anthropic/claude-3-sonnet">Claude 3 Sonnet</option>
-                                <option value="qwen2.5:14b-instruct-8k">Qwen 2.5</option>
-                            </select>
+                            <input type="text" id="model-choice" name="model-choice" placeholder="e.g., gpt-4o-mini, anthropic/claude-3-sonnet" required>
+                            <small>Enter the model identifier exactly as needed by your provider</small>
                         </div>
                         <div class="form-actions">
                             <button type="submit" class="primary-button">Save Changes</button>
