@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pydantic AI MCP Chat</title>
+    <!-- Add Inter font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Add Fira Code for code blocks -->
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <!-- Add Material Icons -->
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+    <!-- Reference CSS from /static path -->
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="main-content">
+        <div class="chat-container">
+            <div class="chat-header">
+                <div class="status-container">
+                    <div class="status-indicator"></div>
+                    <span class="status-text">Connecting...</span>
+                </div>
+                <div class="header-buttons">
+                    <button id="config-btn" class="icon-button" aria-label="Open Configuration">
+                        <span class="material-icons">settings</span>
+                    </button>
+                    <button id="toggle-tools-btn" class="icon-button" aria-label="Toggle Tools Panel">
+                        <span class="material-icons">build</span>
+                    </button>
+                </div>
+            </div>
+            <div id="chat-messages" class="chat-messages"></div>
+            <div class="input-container">
+                <div class="input-wrapper">
+                    <textarea id="message-input" placeholder="Type your message..." rows="1"></textarea>
+                    <button id="send-button" class="send-button" aria-label="Send Message">
+                        <span class="material-icons">send</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div id="tools-panel" class="tools-panel">
+            <div class="tools-header">
+                <h2>Available Tools</h2>
+                <button class="close-tools-btn" aria-label="Close Tools Panel">
+                    <span class="material-icons">close</span>
+                </button>
+            </div>
+            <div id="tools-list" class="tools-list"></div>
+        </div>
+
+        <!-- Configuration Modal -->
+        <div id="config-modal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2>Configuration</h2>
+                    <button class="close-modal-btn" aria-label="Close Configuration">
+                        <span class="material-icons">close</span>
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <form id="config-form">
+                        <div class="form-group">
+                            <label for="base-url">Base URL:</label>
+                            <input type="url" id="base-url" name="base-url" required>
+                            <small>Default: https://api.openai.com/v1</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="api-key">API Key:</label>
+                            <div class="api-key-input">
+                                <input type="password" id="api-key" name="api-key" required>
+                                <button type="button" class="toggle-password" aria-label="Toggle Password Visibility">
+                                    <span class="material-icons">visibility_off</span>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="model-choice">Model:</label>
+                            <select id="model-choice" name="model-choice" required>
+                                <option value="gpt-4o-mini">GPT-4 Mini</option>
+                                <option value="anthropic/claude-3-sonnet">Claude 3 Sonnet</option>
+                                <option value="qwen2.5:14b-instruct-8k">Qwen 2.5</option>
+                            </select>
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" class="primary-button">Save Changes</button>
+                            <button type="button" class="secondary-button" id="cancel-config">Cancel</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Templates -->
+    <template id="message-template">
+        <div class="message">
+            <div class="message-content"></div>
+        </div>
+    </template>
+
+    <template id="loading-template">
+        <div class="loading-indicator">
+            <div class="typing-indicator">
+                <span></span>
+                <span></span>
+                <span></span>
+            </div>
+        </div>
+    </template>
+
+    <template id="error-template">
+        <div class="error-message">
+            <span class="material-icons">error</span>
+            <span class="error-text"></span>
+        </div>
+    </template>
+
+    <template id="tool-template">
+        <div class="tool">
+            <h3 class="tool-name"></h3>
+            <p class="tool-description"></p>
+            <div class="tool-parameters"></div>
+        </div>
+    </template>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+    <script src="/static/chat.js"></script>
+</body>
+</html>
