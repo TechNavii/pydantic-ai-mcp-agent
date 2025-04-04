@@ -66,21 +66,259 @@ def get_model() -> OpenAIModel:
 
     # Check if using OpenRouter
     if 'openrouter' in base_url.lower():
-        logger.info("OpenRouter detected - using OpenRouter format for API")
+        logger.info("OpenRouter detected - configuring for compatibility")
         
-        # OpenRouter compatibility: Set environment variables that OpenAI client uses
-        os.environ['OPENAI_API_VERSION'] = '2023-05-15'
+        # With OpenRouter, allow empty model name to use their default routing
+        if not llm or llm.strip() == "":
+            logger.info("Empty model name detected with OpenRouter - using OpenRouter's default model selection")
+            # Use a default OpenAI model for best compatibility
+            llm = "openai/gpt-3.5-turbo"
+            logger.info(f"Using default model for OpenRouter: {llm}")
         
-        # Add HTTP-referer to the openai default headers
-        from openai import OpenAI
-        OpenAI.default_headers = {"HTTP-Referer": "https://pydantic-ai-mcp-agent.com"}
-        
-        # For OpenRouter, we need to modify the model name to include the provider prefix
-        # if it's not already included and it's an OpenAI model reference
-        if '/' not in llm:
+        # Ensure proper model name formatting for non-empty model names
+        elif '/' not in llm:
+            # For models without provider specification, assume OpenAI to be most compatible
             llm = f"openai/{llm}"
             logger.info(f"Modified model name for OpenRouter: {llm}")
-
+        
+        # Warning for non-OpenAI models - they might have compatibility issues
+        if not llm.startswith("openai/"):
+            logger.warning(f"Using non-OpenAI model with OpenRouter: {llm}")
+            logger.warning("If you experience errors, try using an OpenAI model like 'openai/gpt-3.5-turbo'")
+        
+        # Create custom OpenAIModel for OpenRouter
+        from pydantic_ai.models.openai import OpenAIModel as BaseOpenAIModel
+        
+        class OpenRouterModel(BaseOpenAIModel):
+            """OpenRouter-compatible model that adds the necessary headers to each request."""
+            
+            def __init__(self, model_name, base_url=None, api_key=None):
+                super().__init__(model_name, base_url=base_url, api_key=api_key)
+                # Store base URL and API key for creating clients with different attribute names
+                self._router_base_url = base_url
+                self._router_api_key = api_key
+            
+            async def _completions_create(
+                self,
+                messages,
+                stream,
+                model_settings,
+                model_request_parameters,
+            ):
+                """Override the _completions_create method to add OpenRouter headers."""
+                from openai import OpenAI
+                
+                # Clean base URL to prevent double paths
+                base = self._router_base_url.rstrip('/')
+                if base.endswith('/api/v1'):
+                    base = base  # Keep as is
+                
+                # Create a specific client for this request with the correct base URL
+                client = OpenAI(
+                    api_key=self._router_api_key,
+                    base_url=base,
+                )
+                
+                # Map messages just like the parent method does
+                openai_messages = []
+                for m in messages:
+                    async for msg in self._map_message(m):
+                        openai_messages.append(msg)
+                
+                # Add headers that OpenRouter requires
+                headers = {
+                    "HTTP-Referer": "https://pydantic-ai-mcp-agent.com",
+                    "X-Title": "Pydantic AI MCP Agent"
+                }
+                
+                # Use the standard kwargs from parent but add our headers
+                kwargs = {
+                    "model": self._model_name,
+                    "messages": openai_messages,
+                    "stream": stream,
+                    "extra_headers": headers,  # This is the key change
+                }
+                
+                # Add other optional parameters from model_settings
+                for param, value in model_settings.items():
+                    if value is not None and param != "openai_api_type" and param != "openai_organization":
+                        kwargs[param] = value
+                
+                # Call the OpenAI client directly with our extra headers
+                logger.info(f"Making OpenRouter request with model: {self._model_name}")
+                
+                try:
+                    # Handle different response types from OpenRouter based on the model
+                    response = client.chat.completions.create(**kwargs)
+                    
+                    # Create a wrapper class for the Stream that implements __aenter__ and __aexit__
+                    class AsyncStreamWrapper:
+                        """Wrapper to make a Stream object compatible with async context manager."""
+                        def __init__(self, stream_obj):
+                            self.stream = stream_obj
+                            # Store the first chunk for error detection
+                            self._first_chunk = None
+                            # Track if we've started processing
+                            self._started = False
+                            # Cache for chunks
+                            self._chunks = []
+                            
+                        async def __aenter__(self):
+                            """Implement async context manager entry."""
+                            return self
+                            
+                        async def __aexit__(self, exc_type, exc_value, traceback):
+                            """Implement async context manager exit."""
+                            pass
+                        
+                        def _extract_error_message(self, chunk):
+                            """Extract error message from a chunk if present."""
+                            try:
+                                # Check for different error patterns
+                                if hasattr(chunk, 'error') and chunk.error:
+                                    return f"OpenRouter error: {chunk.error}"
+                                
+                                # Sometimes errors are nested in choices
+                                if hasattr(chunk, 'choices') and chunk.choices:
+                                    choice = chunk.choices[0]
+                                    if hasattr(choice, 'finish_reason') and choice.finish_reason == 'content_filter':
+                                        return "Content filtered by provider"
+                                    if hasattr(choice, 'error') and choice.error:
+                                        return f"Provider error: {choice.error}"
+                                    
+                                # Check for error in raw response
+                                if hasattr(chunk, 'raw') and 'error' in getattr(chunk, 'raw', {}):
+                                    return f"API error: {chunk.raw['error']}"
+                                    
+                                return None
+                            except Exception as e:
+                                logger.error(f"Error extracting error message: {e}")
+                                return None
+                        
+                        def _get_chunks(self):
+                            """Get chunks from synchronous iterator if not already processed."""
+                            if not self._started:
+                                try:
+                                    # Try to get the first chunk to check for errors
+                                    stream_iter = iter(self.stream)
+                                    try:
+                                        self._first_chunk = next(stream_iter)
+                                        # Check if the first chunk contains an error
+                                        error_msg = self._extract_error_message(self._first_chunk)
+                                        if error_msg:
+                                            logger.error(f"Detected error in stream: {error_msg}")
+                                            # Return empty list and let the caller handle it
+                                            self._chunks = []
+                                            # Raise exception to break the processing
+                                            raise ValueError(error_msg)
+                                        
+                                        # If no error, add first chunk and continue
+                                        self._chunks = [self._first_chunk]
+                                        # Add remaining chunks
+                                        for chunk in stream_iter:
+                                            self._chunks.append(chunk)
+                                    except StopIteration:
+                                        # No chunks available
+                                        logger.warning("Stream iterator is empty")
+                                        self._chunks = []
+                                    
+                                    logger.debug(f"Received {len(self._chunks)} chunks from stream")
+                                except Exception as e:
+                                    error_msg = str(e)
+                                    if "Provider returned error" in error_msg:
+                                        # This is a common OpenRouter error
+                                        logger.error(f"OpenRouter error from provider: {error_msg}")
+                                        # Re-raise with more descriptive message
+                                        raise ValueError(f"The provider (Gemini) returned an error. Try an OpenAI model instead.")
+                                    else:
+                                        logger.error(f"Error converting stream to list: {e}")
+                                    self._chunks = []
+                                    # Propagate the error
+                                    raise
+                                finally:
+                                    self._started = True
+                            return self._chunks
+                        
+                        async def __aiter__(self):
+                            """Make this an async iterator by yielding collected chunks."""
+                            try:
+                                chunks = self._get_chunks()
+                                for chunk in chunks:
+                                    yield chunk
+                            except Exception as e:
+                                # Re-raise the error to be caught by the caller
+                                raise ValueError(f"Stream error: {str(e)}")
+                        
+                        async def stream_text(self, *, delta=False):
+                            """Stream text from the completion incrementally."""
+                            try:
+                                # Collect chunks if needed
+                                chunks = self._get_chunks()
+                                
+                                # Create artificial completion if there are no valid chunks
+                                if not chunks:
+                                    # Yield a message explaining the issue to avoid an empty response
+                                    yield "I'm unable to process your request via this model. Please try with an OpenAI model like 'openai/gpt-3.5-turbo' instead."
+                                    return
+                                
+                                for chunk in chunks:
+                                    # Extract text based on mode (delta or full)
+                                    text = None
+                                    
+                                    # Try to extract text from the chunk
+                                    try:
+                                        if delta:
+                                            # Try to get delta.content first
+                                            if hasattr(chunk, 'choices') and chunk.choices:
+                                                if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
+                                                    text = chunk.choices[0].delta.content
+                                                # Fallback to message.content
+                                                elif hasattr(chunk.choices[0], 'message') and hasattr(chunk.choices[0].message, 'content'):
+                                                    text = chunk.choices[0].message.content
+                                        else:
+                                            # Get full message content
+                                            if hasattr(chunk, 'choices') and chunk.choices:
+                                                if hasattr(chunk.choices[0], 'message') and hasattr(chunk.choices[0].message, 'content'):
+                                                    text = chunk.choices[0].message.content
+                                    except Exception as e:
+                                        logger.error(f"Error extracting text from chunk: {e}")
+                                        continue
+                                        
+                                    # Yield the text if it exists
+                                    if text is not None:
+                                        yield text
+                                        
+                            except ValueError as e:
+                                # Handle known errors with readable messages
+                                if "Provider returned error" in str(e):
+                                    yield "I'm unable to process your request with this model. Please try an OpenAI model like 'openai/gpt-3.5-turbo' instead."
+                                else:
+                                    yield f"Error processing response: {str(e)}"
+                            except Exception as e:
+                                logger.error(f"Error in stream_text: {e}")
+                                yield "An error occurred while processing your request. Please try a different model."
+                        
+                        # Proxy all other attributes to the wrapped stream
+                        def __getattr__(self, name):
+                            return getattr(self.stream, name)
+                    
+                    # If the response is a Stream object and not awaitable, 
+                    # we need to wrap it to make it compatible with async context managers
+                    if hasattr(response, '__await__'):
+                        # It's awaitable, we can await it
+                        return await response
+                    else:
+                        # It's already a Stream object, wrap it to support async context manager
+                        logger.info("OpenRouter returned a Stream object - wrapping for compatibility")
+                        return AsyncStreamWrapper(response)
+                        
+                except Exception as e:
+                    logger.error(f"Error creating OpenRouter completion: {e}", exc_info=True)
+                    raise
+        
+        return OpenRouterModel(llm, base_url=base_url, api_key=api_key)
+    
+    # For non-OpenRouter, use the standard model
     logger.info(f"Using model: {llm} with base URL: {base_url}")
     return OpenAIModel(
         llm,
@@ -216,6 +454,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 except Exception as agent_error:
                     logger.error(f"Agent error: {agent_error}", exc_info=True)
                     error_message = str(agent_error)
+                    
+                    # Special handling for OpenRouter errors
+                    if 'openrouter' in os.getenv('BASE_URL', '').lower():
+                        if 'Insufficient credits' in error_message:
+                            error_message = "OpenRouter error: Insufficient credits. Please add more credits in your OpenRouter account: https://openrouter.ai/settings/credits"
+                        elif 'No endpoints found matching your data policy' in error_message:
+                            error_message = "OpenRouter error: Data policy restriction. Please enable prompt training in your OpenRouter settings: https://openrouter.ai/settings/privacy"
+                        elif 'Provider returned error' in error_message:
+                            advice = ("This error often occurs with non-OpenAI models on OpenRouter. "
+                                     "Try using an OpenAI model like 'openai/gpt-3.5-turbo' instead, "
+                                     "or leave the model field empty to use OpenRouter's default selection.")
+                            error_message = f"OpenRouter error: {error_message}\n\nSuggestion: {advice}"
+                    
                     if len(error_message) > 200:
                         error_message = error_message[:200] + "..."
                     await websocket.send_text(json.dumps({
