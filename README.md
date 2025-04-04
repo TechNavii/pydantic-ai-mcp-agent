@@ -6,6 +6,9 @@ A chat application with Pydantic AI MCP (Multi-Call Protocol) tool integration.
 
 This project implements a chat interface that allows users to interact with AI models using Pydantic AI's MCP tools. The application provides a web-based interface where users can send messages and receive responses from the AI, with the AI able to use various MCP tools to accomplish tasks.
 
+ ⭐︎Infludenced from Cole Medin`s project. (using basics like agent and client from below repository) 
+ https://github.com/coleam00/ottomator-agents/tree/main/pydantic-ai-mcp-agent
+
 ## Features
 
 - WebSocket-based chat interface
