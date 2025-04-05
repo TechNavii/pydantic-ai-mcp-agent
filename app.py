@@ -163,10 +163,73 @@ class AsyncStreamWrapper:
 class OpenRouterModel(BaseOpenAIModel):
     """OpenRouter-compatible model that adds required headers and handles stream wrapping."""
     def __init__(self, model_name, base_url=None, api_key=None):
+        # Add missing imports required by the overridden method
+        from datetime import datetime, timezone 
+        from pydantic_ai import messages as pydantic_messages
+        
         super().__init__(model_name, base_url=base_url, api_key=api_key)
         # Store base URL and API key separately for clarity
         self._router_base_url = base_url
         self._router_api_key = api_key
+
+    # --- Override _process_response to handle missing timestamp ---
+    def _process_response(self, response) -> pydantic_messages.ModelResponse:
+        """ Safely process the response, handling potentially missing 'created' timestamp. """
+        from datetime import datetime, timezone
+        from pydantic_ai import messages as pydantic_messages
+        
+        logger.debug(f"Processing response in overridden OpenRouterModel._process_response. Type: {type(response)}")
+
+        # Safely handle the timestamp
+        now = datetime.now(timezone.utc)
+        response_ts_value = getattr(response, 'created', None)
+        if isinstance(response_ts_value, (int, float)):
+            timestamp = datetime.fromtimestamp(response_ts_value, tz=timezone.utc)
+            logger.debug(f"Using timestamp from response.created: {timestamp}")
+        else:
+            timestamp = now
+            logger.warning(f"response.created missing or invalid ('{response_ts_value}'). Using current time: {timestamp}")
+
+        parts = []
+        tool_calls = []
+        message = None
+        finish_reason = None
+
+        # Extract message content and tool calls (similar to base class)
+        if response.choices:
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+            if choice.message:
+                message = choice.message
+                if message.content:
+                    parts.append(pydantic_messages.TextPart(content=message.content))
+                if message.tool_calls:
+                    for tool_call in message.tool_calls:
+                        # Ensure function args are decoded if they are strings
+                        args = tool_call.function.arguments
+                        if isinstance(args, str):
+                             try:
+                                 args = json.loads(args)
+                             except json.JSONDecodeError:
+                                 logger.warning(f"Failed to decode tool call arguments string: {args}")
+                                 # Keep args as string if decoding fails
+                        
+                        parts.append(pydantic_messages.ToolCallPart(
+                            tool_name=tool_call.function.name,
+                            tool_arguments=args, 
+                            tool_call_id=tool_call.id
+                        ))
+                        tool_calls.append(tool_call) # Keep original tool_call object if needed later
+
+        # Construct the ModelResponse
+        model_response = pydantic_messages.ModelResponse(
+            parts=parts,
+            timestamp=timestamp,
+            model_name=self._model_name,
+        )
+        logger.debug(f"Constructed ModelResponse with {len(parts)} parts. Finish Reason from API (ignored): {finish_reason}")
+        return model_response
+    # --- End of override ---
 
     async def _completions_create(
         self,
@@ -276,10 +339,10 @@ def get_model() -> Union[OpenAIModel, AnthropicModel, GeminiModel, OpenRouterMod
     if 'generativelanguage.googleapis.com' in base_url.lower():
         logger.info("Google Gemini API detected - using built-in Gemini model")
         try:
-            model_name = llm
-            if not model_name.startswith('models/'):
-                 model_name = f"models/{model_name}"
-                 logger.info(f"Prepended 'models/' to Gemini model name: {model_name}")
+            # Pass the model name directly from env var (llm) 
+            # Let the GeminiModel class handle any necessary prefixing.
+            model_name = llm 
+            logger.info(f"Using Gemini model name as provided: {model_name}")
             return GeminiModel(model_name, api_key=api_key)
         except Exception as e:
             logger.error(f"Failed to initialize built-in Gemini Model: {e}", exc_info=True)
