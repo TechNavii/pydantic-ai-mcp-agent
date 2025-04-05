@@ -129,9 +129,10 @@ class ChatApp {
         };
 
         this.ws.onmessage = (event) => {
-            console.debug('WebSocket message received:', event.data);
+            console.debug('Raw WebSocket message received:', event.data);
             try {
                 const data = JSON.parse(event.data);
+                console.log('[WebSocket Handler] Parsed message:', data);
                 if (!data || typeof data !== 'object' || !data.type) {
                     throw new Error('Invalid message format');
                 }
@@ -152,10 +153,21 @@ class ChatApp {
                         }
                         break;
                     case 'complete':
+                        console.log("[WebSocket Handler] Received 'complete' message. Content:", data.content);
                         if (typeof data.content === 'string') {
                             this.finalizeAssistantMessage(data.content);
                         } else {
                             console.warn('Invalid complete data format:', data.content);
+                        }
+                        break;
+                    case 'tool_used':
+                        console.log("[WebSocket Handler] Received 'tool_used' message:", data);
+                        if (data.tool_name && typeof data.tool_name === 'string') {
+                            // Simplify display for testing
+                            this.addSystemMessage(`✅ Tool used: ${data.tool_name}`); 
+                            // this.displayToolUsedMessage(data.tool_name); // Keep original commented out
+                        } else {
+                            console.warn('Invalid tool_used data format:', data);
                         }
                         break;
                     case 'error':
@@ -296,19 +308,15 @@ class ChatApp {
     }
 
     addSystemMessage(content) {
-        const messageDiv = document.createElement('div');
-        messageDiv.className = 'message system';
-        messageDiv.textContent = content;
+        console.log('[addSystemMessage] Called with:', content);
+        const messageDiv = this.messageTemplate.content.cloneNode(true).querySelector('.message');
+        messageDiv.classList.add('system');
+        messageDiv.querySelector('.message-content').textContent = content;
         this.messagesContainer.appendChild(messageDiv);
         this.scrollToBottom();
     }
 
     updateAssistantMessage(delta) {
-        if (typeof delta !== 'string') {
-            console.warn('Invalid delta received:', delta);
-            return;
-        }
-
         if (!this.isTyping) {
             this.isTyping = true;
             this.currentAssistantMessage = '';
@@ -328,42 +336,61 @@ class ChatApp {
     }
 
     finalizeAssistantMessage(finalContent, isError = false) {
-        if (!this.isTyping || !this.currentAssistantMessageDiv) {
-            return;
+        console.log(`[finalizeAssistantMessage] Called. isTyping: ${this.isTyping}, finalContent: "${finalContent ? finalContent.substring(0, 50) + '...' : ''}", isError: ${isError}`);
+
+        let targetDiv = this.currentAssistantMessageDiv;
+
+        // If we weren't typing (no deltas received) but have final content, create a div now.
+        if (!this.isTyping && finalContent && !isError) {
+            console.log('[finalizeAssistantMessage] No prior deltas, creating new message div for final content.');
+            targetDiv = this.addMessage('', 'assistant', false); // Create non-typing div
+            this.currentAssistantMessageDiv = targetDiv; // Assign it so the rest of the logic can use it
         }
+        
+        // If there's no target div after the above check (e.g., error occurred before typing started, or empty final content),
+        // we still need to proceed to the finally block to re-enable input.
+        if (!targetDiv) {
+             console.warn('[finalizeAssistantMessage] No targetDiv found. Proceeding to finally block.');
+        } else { 
+            // Only attempt to update content if we have a target div
+            try {
+                this.isTyping = false; // Ensure typing state is reset
+                const messageContent = targetDiv.querySelector('.message-content');
+                if (messageContent) {
+                    const content = finalContent || this.currentAssistantMessage; // Use finalContent if available
+                    console.log('[finalizeAssistantMessage] Setting final HTML content.');
+                    messageContent.innerHTML = this.formatMarkdown(content);
+                    targetDiv.classList.remove('typing'); // Remove typing indicator
 
-        try {
-            this.isTyping = false;
-            const messageContent = this.currentAssistantMessageDiv.querySelector('.message-content');
-            if (messageContent) {
-                const content = finalContent || this.currentAssistantMessage;
-                messageContent.innerHTML = this.formatMarkdown(content);
-                this.currentAssistantMessageDiv.classList.remove('typing');
-
-                if (!isError && typeof content === 'string') {
-                    // Add to message history
-                    this.messageHistory.push({
-                        role: 'assistant',
-                        content: content
-                    });
-                    
-                    // Trim history if it gets too long
-                    if (this.messageHistory.length > 50) {
-                        this.messageHistory = this.messageHistory.slice(-50);
+                    if (!isError && typeof content === 'string' && content.trim() !== '') { // Only add non-empty messages to history
+                        this.messageHistory.push({
+                            role: 'assistant',
+                            content: content
+                        });
+                        if (this.messageHistory.length > 50) {
+                            this.messageHistory = this.messageHistory.slice(-50);
+                        }
+                        console.log('[finalizeAssistantMessage] Updated message history.');
                     }
-                    
-                    console.log('Updated message history:', this.messageHistory);
+                } else {
+                     console.warn('[finalizeAssistantMessage] messageContent element not found within targetDiv.');
                 }
+            } catch (error) {
+                console.error('Error finalizing assistant message content:', error);
+                // Ensure we still proceed to finally block
             }
-        } catch (error) {
-            console.error('Error finalizing assistant message:', error);
-        } finally {
-            this.currentAssistantMessage = '';
-            this.currentAssistantMessageDiv = null;
-            this.sendButton.disabled = false;
-            this.messageInput.disabled = false;
-            this.messageInput.focus();
         }
+        
+        // --- Finally block MUST run to re-enable input --- 
+        console.log('[finalizeAssistantMessage] Entering finally block.');
+        this.currentAssistantMessage = '';
+        this.currentAssistantMessageDiv = null; // Clear the reference
+        this.isTyping = false; // Ensure typing state is false
+        this.sendButton.disabled = false;
+        this.messageInput.disabled = false;
+        console.log('[finalizeAssistantMessage] Input re-enabled.');
+        this.messageInput.focus();
+        this.scrollToBottom(); // Scroll after final content is set
     }
 
     showError(error) {
@@ -493,11 +520,18 @@ class ChatApp {
     async handleConfigSubmit(event) {
         event.preventDefault();
         const formData = new FormData(this.configForm);
+        const baseUrl = formData.get('base-url');
+        
         const config = {
-            base_url: formData.get('base-url'),
+            base_url: baseUrl,
             api_key: formData.get('api-key'),
-            model_choice: formData.get('model-choice')
+            model_choice: formData.get('model-choice') || ''
         };
+        
+        // Show a note when using OpenRouter with empty model
+        if (baseUrl.includes('openrouter') && !config.model_choice) {
+            this.addSystemMessage('Using OpenRouter with automatic model selection');
+        }
 
         try {
             const response = await fetch('/api/config', {
@@ -552,6 +586,25 @@ class ChatApp {
         successDiv.querySelector('.material-icons').textContent = 'check_circle';
         successDiv.querySelector('.error-text').textContent = message;
         this.messagesContainer.appendChild(successElement);
+        this.scrollToBottom();
+    }
+
+    displayToolUsedMessage(toolName) {
+        console.log(`Displaying tool used message: ${toolName}`);
+        const messageElement = this.messageTemplate.content.cloneNode(true);
+        const messageDiv = messageElement.querySelector('.message');
+        const contentDiv = messageDiv.querySelector('.message-content');
+        const avatar = messageDiv.querySelector('.avatar');
+
+        messageDiv.classList.add('system', 'tool-used-message'); // Style as system message
+        avatar.remove(); // Remove avatar for system-like message
+        
+        contentDiv.innerHTML = `<i>✅ Tool used: ${this.escapeHtml(toolName)}</i>`; 
+
+        const cursor = messageDiv.querySelector('.cursor');
+        if (cursor) cursor.remove();
+
+        this.messagesContainer.appendChild(messageDiv);
         this.scrollToBottom();
     }
 }

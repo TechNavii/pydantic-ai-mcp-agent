@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 import asyncio
 import json
 import os
@@ -13,7 +13,10 @@ from dotenv import load_dotenv, set_key, find_dotenv
 
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.gemini import GeminiModel
 import mcp_client
+from pydantic_ai import messages as pydantic_messages
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +31,209 @@ SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
 CONFIG_FILE = SCRIPT_DIR / "mcp_config.json"
 # Define the static files directory
 STATIC_DIR = SCRIPT_DIR / "static"
+
+# --- Define OpenRouterModel and AsyncStreamWrapper at the top level ---
+from pydantic_ai.models.openai import OpenAIModel as BaseOpenAIModel
+from openai import OpenAI # Keep OpenAI import needed for OpenRouterModel
+
+class AsyncStreamWrapper:
+    """Wrapper to make a synchronous Stream object compatible with async context manager."""
+    def __init__(self, stream_obj):
+        self.stream = stream_obj
+        self._first_chunk = None
+        self._started = False
+        self._chunks = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        pass
+
+    def _extract_error_message(self, chunk):
+         try:
+            if hasattr(chunk, 'error') and chunk.error: return f"OpenRouter error: {chunk.error}"
+            if hasattr(chunk, 'choices') and chunk.choices:
+                choice = chunk.choices[0]
+                if hasattr(choice, 'finish_reason') and choice.finish_reason == 'content_filter': return "Content filtered by provider"
+                if hasattr(choice, 'error') and choice.error: return f"Provider error: {choice.error}"
+            if hasattr(chunk, 'raw') and 'error' in getattr(chunk, 'raw', {}): return f"API error: {chunk.raw['error']}"
+            return None
+         except Exception as e: logger.error(f"[AsyncStreamWrapper] Error extracting error message: {e}"); return None
+
+    def _get_chunks(self):
+        # This runs synchronously to exhaust the iterator initially
+        if not self._started:
+            try:
+                stream_iter = iter(self.stream)
+                try:
+                    self._first_chunk = next(stream_iter)
+                    error_msg = self._extract_error_message(self._first_chunk)
+                    if error_msg:
+                        logger.error(f"[AsyncStreamWrapper] Detected error in stream: {error_msg}")
+                        self._chunks = []
+                        raise ValueError(error_msg) # Raise error to be caught by __aiter__ or stream_text
+                    self._chunks = [self._first_chunk]
+                    # Consume the rest of the synchronous stream
+                    for chunk in stream_iter: self._chunks.append(chunk)
+                except StopIteration: 
+                    logger.warning("[AsyncStreamWrapper] Stream iterator was empty on first next() call.")
+                    self._chunks = [] 
+                    # If first chunk had error, it would have been raised already
+                    # If no first chunk, it's just empty, not necessarily an error yet
+                except ValueError as ve:
+                     raise ve # Propagate error detected in first chunk
+                except Exception as iter_exc:
+                     logger.error(f"[AsyncStreamWrapper] Error during initial stream iteration: {iter_exc}", exc_info=True)
+                     self._chunks = []
+                     # Re-raise as ValueError for consistent handling
+                     raise ValueError(f"Error processing stream: {iter_exc}")
+                     
+                logger.debug(f"[AsyncStreamWrapper] Received {len(self._chunks)} chunks from stream")
+            finally: 
+                self._started = True
+        return self._chunks
+
+    async def __aiter__(self):
+        # This makes the class async iterable
+        try:
+            # Ensure chunks are loaded synchronously first
+            chunks = self._get_chunks() 
+            for chunk in chunks:
+                yield chunk
+        except ValueError as ve:
+             # Catch errors raised during _get_chunks (like first chunk error)
+             logger.error(f"[AsyncStreamWrapper] Error during async iteration setup: {ve}")
+             # Special handling for OpenRouter provider errors detected in _get_chunks
+             if "Provider returned error" in str(ve):
+                  # Make error more specific for OpenRouter context
+                  raise ValueError(f"OpenRouter Error: The underlying provider ({self.stream.model if hasattr(self.stream, 'model') else 'unknown'}) returned an error. This model may be incompatible or unavailable via OpenRouter. Try an OpenAI model instead.")
+             else:
+                 # Re-raise other ValueErrors caught during chunk loading
+                 raise ValueError(f"Stream error: {str(ve)}")
+        except Exception as e:
+            logger.error(f"[AsyncStreamWrapper] Unexpected error during async iteration: {e}", exc_info=True)
+            raise ValueError(f"Unexpected stream error: {str(e)}")
+
+    async def stream_text(self, *, delta=False):
+        # Stream text content, handling potential errors during chunk loading
+        try:
+            # Ensure chunks are loaded, catching potential errors
+            chunks = self._get_chunks() 
+            if not chunks:
+                logger.warning("[AsyncStreamWrapper] No chunks available to stream text.")
+                # Check if an error occurred during loading (should have been raised by _get_chunks)
+                # Yield a message indicating potential loading issue
+                yield "[Info: Stream empty or error occurred during initialization]"
+                return
+
+            for chunk in chunks:
+                text = None
+                try:
+                    if delta:
+                        if hasattr(chunk, 'choices') and chunk.choices:
+                            delta_data = chunk.choices[0].delta
+                            if hasattr(delta_data, 'content'): text = delta_data.content
+                    else: # Non-delta
+                         if hasattr(chunk, 'choices') and chunk.choices:
+                             message_data = chunk.choices[0].message
+                             if hasattr(message_data, 'content'): text = message_data.content
+                except Exception as e: logger.error(f"[AsyncStreamWrapper] Error extracting text from chunk: {e}"); continue
+                if text is not None: yield text
+        except ValueError as ve:
+             # Catch errors raised during _get_chunks
+             logger.error(f"[AsyncStreamWrapper] Error during stream_text setup: {ve}")
+             # Provide specific feedback based on the error
+             if "Provider returned error" in str(ve):
+                 # Use the refined error message
+                 yield f"[OpenRouter Error: The underlying provider returned an error. This model may be incompatible or unavailable via OpenRouter. Try an OpenAI model instead.]"
+             elif "Stream error:" in str(ve):
+                 yield f"[{str(ve)}]" # Pass specific stream errors through
+             else:
+                  yield f"[Error processing stream response: {str(ve)}]"
+        except Exception as e:
+            logger.error(f"[AsyncStreamWrapper] Unexpected error in stream_text: {e}", exc_info=True)
+            yield "[An unexpected error occurred while processing the stream.]"
+
+    def __getattr__(self, name):
+        # Proxy other attributes to the wrapped stream object if needed
+        return getattr(self.stream, name)
+
+class OpenRouterModel(BaseOpenAIModel):
+    """OpenRouter-compatible model that adds required headers and handles stream wrapping."""
+    def __init__(self, model_name, base_url=None, api_key=None):
+        super().__init__(model_name, base_url=base_url, api_key=api_key)
+        # Store base URL and API key separately for clarity
+        self._router_base_url = base_url
+        self._router_api_key = api_key
+
+    async def _completions_create(
+        self,
+        messages,
+        stream,
+        model_settings,
+        model_request_parameters,
+    ):
+        """Override _completions_create to add headers and wrap stream."""
+        base = self._router_base_url.rstrip('/')
+        # Ensure /v1 endpoint for OpenRouter compatibility
+        if not base.endswith('/v1'):
+             if base.endswith('/api'): # Handle cases like '.../api'
+                 base = f"{base}/v1"
+             elif not base.endswith('/'): # Ensure trailing slash before adding /v1 if needed
+                 base = f"{base}/v1"
+             else:
+                  base = f"{base}v1"
+             logger.info(f"Adjusted OpenRouter base URL to: {base}")
+
+
+        client = OpenAI(api_key=self._router_api_key, base_url=base)
+
+        openai_messages = []
+        for m in messages:
+            async for msg in self._map_message(m):
+                openai_messages.append(msg)
+
+        headers = {
+            "HTTP-Referer": "https://pydantic-ai-mcp-agent.com", # Replace if needed
+            "X-Title": "Pydantic AI MCP Agent"
+        }
+
+        kwargs = {
+            "model": self._model_name,
+            "messages": openai_messages,
+            "stream": stream,
+            "extra_headers": headers,
+        }
+
+        for param, value in model_settings.items():
+            if value is not None and param not in ["openai_api_type", "openai_organization"]:
+                 kwargs[param] = value
+
+        logger.info(f"Making OpenRouter request with model: {self._model_name}")
+
+        try:
+            response = client.chat.completions.create(**kwargs)
+
+            # If streaming, wrap the synchronous stream from openai client v1+
+            if stream and not hasattr(response, '__aiter__'):
+                logger.info("OpenRouter returned a non-async stream - wrapping for compatibility")
+                return AsyncStreamWrapper(response)
+            else:
+                # If already async (shouldn't happen with current openai lib?) or not streaming
+                return response
+        except Exception as e:
+            # Catch API errors during the create call itself
+            logger.error(f"Error creating OpenRouter completion: {e}", exc_info=True)
+            # Check for common OpenRouter errors here if possible, e.g., 402 Payment Required
+            if hasattr(e, 'status_code'):
+                 if e.status_code == 402:
+                     raise exceptions.ModelError("OpenRouter error: Insufficient credits. Please add credits at https://openrouter.ai/settings/credits")
+                 elif e.status_code == 429: # Rate limit
+                     raise exceptions.ModelError("OpenRouter error: Rate limit hit. Please check your limits or wait.")
+            # Re-raise generic error if not specifically handled
+            raise exceptions.ModelError(f"OpenRouter API request failed: {e}")
+# --- End of top-level definitions ---
 
 class ChatMessage(BaseModel):
     """Represents a chat message."""
@@ -57,274 +263,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_model() -> OpenAIModel:
-    """Get the configured OpenAI model."""
+def get_model() -> Union[OpenAIModel, AnthropicModel, GeminiModel, OpenRouterModel]: # Add OpenRouterModel to hint
+    """Get the configured model based on provider and settings."""
     llm = os.getenv('MODEL_CHOICE', 'gpt-4o-mini')
     base_url = os.getenv('BASE_URL', 'https://api.openai.com/v1')
     api_key = os.getenv('LLM_API_KEY', 'no-api-key-provided')
-    provider = os.getenv('PROVIDER', 'openai').lower()
 
-    # Check if using OpenRouter
-    if 'openrouter' in base_url.lower():
-        logger.info("OpenRouter detected - configuring for compatibility")
-        
-        # With OpenRouter, allow empty model name to use their default routing
-        if not llm or llm.strip() == "":
-            logger.info("Empty model name detected with OpenRouter - using OpenRouter's default model selection")
-            # Use a default OpenAI model for best compatibility
-            llm = "openai/gpt-3.5-turbo"
-            logger.info(f"Using default model for OpenRouter: {llm}")
-        
-        # Ensure proper model name formatting for non-empty model names
-        elif '/' not in llm:
-            # For models without provider specification, assume OpenAI to be most compatible
-            llm = f"openai/{llm}"
-            logger.info(f"Modified model name for OpenRouter: {llm}")
-        
-        # Warning for non-OpenAI models - they might have compatibility issues
-        if not llm.startswith("openai/"):
-            logger.warning(f"Using non-OpenAI model with OpenRouter: {llm}")
-            logger.warning("If you experience errors, try using an OpenAI model like 'openai/gpt-3.5-turbo'")
-        
-        # Create custom OpenAIModel for OpenRouter
-        from pydantic_ai.models.openai import OpenAIModel as BaseOpenAIModel
-        
-        class OpenRouterModel(BaseOpenAIModel):
-            """OpenRouter-compatible model that adds the necessary headers to each request."""
-            
-            def __init__(self, model_name, base_url=None, api_key=None):
-                super().__init__(model_name, base_url=base_url, api_key=api_key)
-                # Store base URL and API key for creating clients with different attribute names
-                self._router_base_url = base_url
-                self._router_api_key = api_key
-            
-            async def _completions_create(
-                self,
-                messages,
-                stream,
-                model_settings,
-                model_request_parameters,
-            ):
-                """Override the _completions_create method to add OpenRouter headers."""
-                from openai import OpenAI
-                
-                # Clean base URL to prevent double paths
-                base = self._router_base_url.rstrip('/')
-                if base.endswith('/api/v1'):
-                    base = base  # Keep as is
-                
-                # Create a specific client for this request with the correct base URL
-                client = OpenAI(
-                    api_key=self._router_api_key,
-                    base_url=base,
-                )
-                
-                # Map messages just like the parent method does
-                openai_messages = []
-                for m in messages:
-                    async for msg in self._map_message(m):
-                        openai_messages.append(msg)
-                
-                # Add headers that OpenRouter requires
-                headers = {
-                    "HTTP-Referer": "https://pydantic-ai-mcp-agent.com",
-                    "X-Title": "Pydantic AI MCP Agent"
-                }
-                
-                # Use the standard kwargs from parent but add our headers
-                kwargs = {
-                    "model": self._model_name,
-                    "messages": openai_messages,
-                    "stream": stream,
-                    "extra_headers": headers,  # This is the key change
-                }
-                
-                # Add other optional parameters from model_settings
-                for param, value in model_settings.items():
-                    if value is not None and param != "openai_api_type" and param != "openai_organization":
-                        kwargs[param] = value
-                
-                # Call the OpenAI client directly with our extra headers
-                logger.info(f"Making OpenRouter request with model: {self._model_name}")
-                
-                try:
-                    # Handle different response types from OpenRouter based on the model
-                    response = client.chat.completions.create(**kwargs)
-                    
-                    # Create a wrapper class for the Stream that implements __aenter__ and __aexit__
-                    class AsyncStreamWrapper:
-                        """Wrapper to make a Stream object compatible with async context manager."""
-                        def __init__(self, stream_obj):
-                            self.stream = stream_obj
-                            # Store the first chunk for error detection
-                            self._first_chunk = None
-                            # Track if we've started processing
-                            self._started = False
-                            # Cache for chunks
-                            self._chunks = []
-                            
-                        async def __aenter__(self):
-                            """Implement async context manager entry."""
-                            return self
-                            
-                        async def __aexit__(self, exc_type, exc_value, traceback):
-                            """Implement async context manager exit."""
-                            pass
-                        
-                        def _extract_error_message(self, chunk):
-                            """Extract error message from a chunk if present."""
-                            try:
-                                # Check for different error patterns
-                                if hasattr(chunk, 'error') and chunk.error:
-                                    return f"OpenRouter error: {chunk.error}"
-                                
-                                # Sometimes errors are nested in choices
-                                if hasattr(chunk, 'choices') and chunk.choices:
-                                    choice = chunk.choices[0]
-                                    if hasattr(choice, 'finish_reason') and choice.finish_reason == 'content_filter':
-                                        return "Content filtered by provider"
-                                    if hasattr(choice, 'error') and choice.error:
-                                        return f"Provider error: {choice.error}"
-                                    
-                                # Check for error in raw response
-                                if hasattr(chunk, 'raw') and 'error' in getattr(chunk, 'raw', {}):
-                                    return f"API error: {chunk.raw['error']}"
-                                    
-                                return None
-                            except Exception as e:
-                                logger.error(f"Error extracting error message: {e}")
-                                return None
-                        
-                        def _get_chunks(self):
-                            """Get chunks from synchronous iterator if not already processed."""
-                            if not self._started:
-                                try:
-                                    # Try to get the first chunk to check for errors
-                                    stream_iter = iter(self.stream)
-                                    try:
-                                        self._first_chunk = next(stream_iter)
-                                        # Check if the first chunk contains an error
-                                        error_msg = self._extract_error_message(self._first_chunk)
-                                        if error_msg:
-                                            logger.error(f"Detected error in stream: {error_msg}")
-                                            # Return empty list and let the caller handle it
-                                            self._chunks = []
-                                            # Raise exception to break the processing
-                                            raise ValueError(error_msg)
-                                        
-                                        # If no error, add first chunk and continue
-                                        self._chunks = [self._first_chunk]
-                                        # Add remaining chunks
-                                        for chunk in stream_iter:
-                                            self._chunks.append(chunk)
-                                    except StopIteration:
-                                        # No chunks available
-                                        logger.warning("Stream iterator is empty")
-                                        self._chunks = []
-                                    
-                                    logger.debug(f"Received {len(self._chunks)} chunks from stream")
-                                except Exception as e:
-                                    error_msg = str(e)
-                                    if "Provider returned error" in error_msg:
-                                        # This is a common OpenRouter error
-                                        logger.error(f"OpenRouter error from provider: {error_msg}")
-                                        # Re-raise with more descriptive message
-                                        raise ValueError(f"The provider (Gemini) returned an error. Try an OpenAI model instead.")
-                                    else:
-                                        logger.error(f"Error converting stream to list: {e}")
-                                    self._chunks = []
-                                    # Propagate the error
-                                    raise
-                                finally:
-                                    self._started = True
-                            return self._chunks
-                        
-                        async def __aiter__(self):
-                            """Make this an async iterator by yielding collected chunks."""
-                            try:
-                                chunks = self._get_chunks()
-                                for chunk in chunks:
-                                    yield chunk
-                            except Exception as e:
-                                # Re-raise the error to be caught by the caller
-                                raise ValueError(f"Stream error: {str(e)}")
-                        
-                        async def stream_text(self, *, delta=False):
-                            """Stream text from the completion incrementally."""
-                            try:
-                                # Collect chunks if needed
-                                chunks = self._get_chunks()
-                                
-                                # Create artificial completion if there are no valid chunks
-                                if not chunks:
-                                    # Yield a message explaining the issue to avoid an empty response
-                                    yield "I'm unable to process your request via this model. Please try with an OpenAI model like 'openai/gpt-3.5-turbo' instead."
-                                    return
-                                
-                                for chunk in chunks:
-                                    # Extract text based on mode (delta or full)
-                                    text = None
-                                    
-                                    # Try to extract text from the chunk
-                                    try:
-                                        if delta:
-                                            # Try to get delta.content first
-                                            if hasattr(chunk, 'choices') and chunk.choices:
-                                                if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
-                                                    text = chunk.choices[0].delta.content
-                                                # Fallback to message.content
-                                                elif hasattr(chunk.choices[0], 'message') and hasattr(chunk.choices[0].message, 'content'):
-                                                    text = chunk.choices[0].message.content
-                                        else:
-                                            # Get full message content
-                                            if hasattr(chunk, 'choices') and chunk.choices:
-                                                if hasattr(chunk.choices[0], 'message') and hasattr(chunk.choices[0].message, 'content'):
-                                                    text = chunk.choices[0].message.content
-                                    except Exception as e:
-                                        logger.error(f"Error extracting text from chunk: {e}")
-                                        continue
-                                        
-                                    # Yield the text if it exists
-                                    if text is not None:
-                                        yield text
-                                        
-                            except ValueError as e:
-                                # Handle known errors with readable messages
-                                if "Provider returned error" in str(e):
-                                    yield "I'm unable to process your request with this model. Please try an OpenAI model like 'openai/gpt-3.5-turbo' instead."
-                                else:
-                                    yield f"Error processing response: {str(e)}"
-                            except Exception as e:
-                                logger.error(f"Error in stream_text: {e}")
-                                yield "An error occurred while processing your request. Please try a different model."
-                        
-                        # Proxy all other attributes to the wrapped stream
-                        def __getattr__(self, name):
-                            return getattr(self.stream, name)
-                    
-                    # If the response is a Stream object and not awaitable, 
-                    # we need to wrap it to make it compatible with async context managers
-                    if hasattr(response, '__await__'):
-                        # It's awaitable, we can await it
-                        return await response
-                    else:
-                        # It's already a Stream object, wrap it to support async context manager
-                        logger.info("OpenRouter returned a Stream object - wrapping for compatibility")
-                        return AsyncStreamWrapper(response)
-                        
-                except Exception as e:
-                    logger.error(f"Error creating OpenRouter completion: {e}", exc_info=True)
-                    raise
-        
-        return OpenRouterModel(llm, base_url=base_url, api_key=api_key)
+    logger.info(f"Attempting to configure model: {llm} with base URL: {base_url}")
+
+    # Check for Google Gemini API
+    if 'generativelanguage.googleapis.com' in base_url.lower():
+        logger.info("Google Gemini API detected - using built-in Gemini model")
+        try:
+            model_name = llm
+            if not model_name.startswith('models/'):
+                 model_name = f"models/{model_name}"
+                 logger.info(f"Prepended 'models/' to Gemini model name: {model_name}")
+            return GeminiModel(model_name, api_key=api_key)
+        except Exception as e:
+            logger.error(f"Failed to initialize built-in Gemini Model: {e}", exc_info=True)
+            raise ValueError(f"Failed to configure Gemini. Check API key and model name ('{llm}'). Error: {e}")
+
+    # Check for Anthropic API
+    elif 'api.anthropic.com' in base_url.lower():
+        logger.info("Anthropic API detected - using built-in Anthropic model")
+        try:
+            # Instantiate the built-in AnthropicModel
+            # Pass the original model name directly from env var (llm)
+            # Removed the logic that stripped the date suffix
+            model_name = llm 
+            logger.info(f"Using Anthropic model name as provided: {model_name}")
+            return AnthropicModel(model_name, api_key=api_key)
+        except Exception as e:
+            logger.error(f"Failed to initialize built-in Anthropic Model: {e}", exc_info=True)
+            raise ValueError(f"Failed to configure Anthropic. Check API key and model name ('{llm}'). Error: {e}")
     
-    # For non-OpenRouter, use the standard model
-    logger.info(f"Using model: {llm} with base URL: {base_url}")
-    return OpenAIModel(
-        llm,
-        base_url=base_url,
-        api_key=api_key
-    )
+    # Check for DeepSeek API (using standard OpenAIModel)
+    elif 'api.deepseek.com' in base_url.lower():
+        logger.info("DeepSeek API detected - using standard OpenAIModel")
+        return OpenAIModel(
+            llm,
+            base_url=base_url, # Use DeepSeek's base URL
+            api_key=api_key
+        )
+        
+    # Check if using OpenRouter
+    elif 'openrouter' in base_url.lower():
+        # --- Revert to using the top-level OpenRouterModel class ---
+        logger.info("OpenRouter detected - configuring custom OpenRouterModel for compatibility")
+        
+        openrouter_llm = llm 
+        # Apply model name formatting specific to OpenRouter recommendations
+        if not openrouter_llm or openrouter_llm.strip() == "":
+            openrouter_llm = "openai/gpt-3.5-turbo" # Default suggested by OpenRouter
+            logger.info(f"Using default model for OpenRouter: {openrouter_llm}")
+        elif '/' not in openrouter_llm:
+             openrouter_llm = f"openai/{openrouter_llm}"
+             logger.info(f"Assuming openai prefix for OpenRouter model: {openrouter_llm}")
+
+        # Warning for non-OpenAI models (still relevant)
+        if not openrouter_llm.startswith("openai/"):
+            logger.warning(f"Using non-OpenAI model ({openrouter_llm}) with OpenRouter. Tool calling and streaming might be unreliable.")
+
+        # Instantiate the custom model defined at the top level
+        # This uses the AsyncStreamWrapper for better streaming compatibility
+        return OpenRouterModel(openrouter_llm, base_url=base_url, api_key=api_key)
+        # --- End Reverted OpenRouter Handling ---
+    
+    # Default to standard OpenAI model
+    else:
+        if not base_url or not base_url.startswith('http'):
+             logger.warning(f"Invalid or empty BASE_URL provided: '{base_url}'. Falling back to default OpenAI URL.")
+             base_url = 'https://api.openai.com/v1' # Default OpenAI URL
+
+        logger.info(f"Defaulting to standard OpenAI model for base URL: {base_url}")
+        return OpenAIModel(
+            llm,
+            base_url=base_url,
+            api_key=api_key
+        )
 
 async def get_pydantic_ai_agent() -> tuple[mcp_client.MCPClient, Agent]:
     """Initialize and return the MCP client and agent."""
@@ -346,12 +363,18 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection accepted.")
     mcp_agent_client: Optional[mcp_client.MCPClient] = None
+    active_model_instance = None # Store the instantiated model
     
     try:
-        # Initialize the agent for this connection
+        # Modify agent initialization to store the model instance
         logger.info("Starting agent initialization...")
-        mcp_agent_client, mcp_agent = await get_pydantic_ai_agent()
-        logger.info("Agent initialization complete.")
+        client = mcp_client.MCPClient()
+        client.load_servers(str(CONFIG_FILE))
+        tools = await client.start()
+        active_model_instance = get_model() # Get and store the model
+        mcp_agent = Agent(model=active_model_instance, tools=tools)
+        mcp_agent_client = client # Assign client after successful start
+        logger.info("MCP client and Pydantic AI agent initialized successfully.")
         
         # Send the tools information to the client
         logger.info("Preparing tools information...")
@@ -393,9 +416,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         current_msg_content = str(current_msg_content)
                     
                     logger.debug(f"Current message content: {current_msg_content}")
-
-                    # For now, don't send any history to avoid the 'Expected code to be unreachable' error
-                    logger.info("Skipping message history to avoid unreachable code error")
                     pydantic_message_history = []
                     
                     logger.info("Starting agent.run_stream...")
@@ -407,71 +427,135 @@ async def websocket_endpoint(websocket: WebSocket):
                     async with mcp_agent.run_stream(
                         current_msg_content,  # Pass the content string directly
                         message_history=pydantic_message_history  # Empty history to avoid errors
-                    ) as result:
-                        logger.debug("Agent stream started successfully")
+                    ) as result: # result is likely an AgentStream object here
+                        logger.debug("Agent stream context manager entered.")
                         curr_message = ""
+                        tool_calls_in_run = set() # Reset for each run
                         try:
-                            logger.info("Starting stream processing...")
-                            async for message_delta in result.stream_text(delta=True):
-                                if not message_delta:
-                                    logger.debug("Empty delta received, skipping")
-                                    continue
-                                    
-                                logger.debug(f"Delta received: {message_delta}")
-                                curr_message += message_delta
-                                
-                                try:
-                                    await websocket.send_text(json.dumps({
-                                        "type": "delta",
-                                        "content": message_delta
-                                    }))
-                                except Exception as send_error:
-                                    logger.error(f"Error sending delta: {send_error}", exc_info=True)
-                                    raise
+                            logger.info("Accumulating agent final text response via result.stream()...")
+                            # Loop ONLY to get final text, DO NOT send deltas here yet.
+                            async for event in result.stream(): 
+                                if isinstance(event, pydantic_messages.PartDeltaEvent) and isinstance(event.delta, pydantic_messages.TextPartDelta):
+                                    delta = event.delta.content_delta
+                                    if delta:
+                                        curr_message += delta
+                                        # DO NOT send delta here: await websocket.send_text(...)
+                                        
+                            logger.info("Agent final text stream finished accumulating.")
+                            logger.debug(f"Accumulated text length: {len(curr_message)}")
                             
-                            logger.info("Stream processing complete.")
-                            if curr_message:
-                                logger.debug(f"Final message length: {len(curr_message)}")
-                                await websocket.send_text(json.dumps({
-                                    "type": "complete",
-                                    "content": curr_message
-                                }))
-                                logger.info("Complete message sent.")
+                            # ===== Perform history check FIRST =====
+                            logger.info("Performing final checks for tools used.")
+                            final_tool_names_found = set() 
+                            history_to_check = []
+                            if result and hasattr(result, '_all_messages') and isinstance(result._all_messages, list):
+                                history_to_check = result._all_messages
+                                logger.info(f"Using final result._all_messages ({len(history_to_check)} messages) for tool check.")
+                            elif hasattr(mcp_agent, 'messages') and isinstance(mcp_agent.messages, list):
+                                history_to_check = mcp_agent.messages
+                                logger.info(f"Using mcp_agent.messages ({len(history_to_check)} messages) for tool check.")
                             else:
-                                logger.warning("No response generated by agent")
-                                raise ValueError("No response generated by the agent")
+                                 logger.warning("Could not access a valid message history list for final tool check.")
+                
+                            if history_to_check:
+                                found_tool_call_in_history = False
+                                logger.info(f"Inspecting history ({len(history_to_check)} messages) for ToolCallParts...")
+                                for msg in history_to_check:
+                                    if isinstance(msg, pydantic_messages.ModelResponse):
+                                         if hasattr(msg, 'parts') and isinstance(msg.parts, list):
+                                             for part in msg.parts:
+                                                 if isinstance(part, pydantic_messages.ToolCallPart):
+                                                      tool_name = getattr(part, 'tool_name', 'unknown_tool')
+                                                      final_tool_names_found.add(tool_name)
+                                                      found_tool_call_in_history = True
+                                if not found_tool_call_in_history:
+                                     logger.info("  No ToolCallPart found in the checked history.")
+                                     
+                            # --- Extract final text response from history if stream was empty ---
+                            final_text_from_history = ""
+                            if not curr_message and history_to_check:
+                                last_message = history_to_check[-1]
+                                if isinstance(last_message, pydantic_messages.ModelResponse):
+                                     if hasattr(last_message, 'parts') and isinstance(last_message.parts, list):
+                                         for part in last_message.parts:
+                                             if isinstance(part, pydantic_messages.TextPart):
+                                                 final_text_from_history = part.content
+                                                 logger.info(f"Found final text in last message history: '{final_text_from_history[:50]}...'")
+                                                 break 
+                                                 
+                            # ===== Send TOOL messages SECOND =====
+                            if final_tool_names_found:
+                                logger.info(f"Sending final tool usage info for: {final_tool_names_found}")
+                                for tool_name in final_tool_names_found:
+                                     logger.info(f"Sending tool_used message for {tool_name} based on final history check.")
+                                     await websocket.send_text(json.dumps({
+                                        "type": "tool_used", 
+                                        "tool_name": tool_name
+                                     }))
+                                     
+                            # ===== Send COMPLETION message THIRD =====
+                            final_completion_text = curr_message if curr_message else final_text_from_history
+                                     
+                            if final_completion_text:
+                                logger.debug(f"Sending final completion text length: {len(final_completion_text)}")
+                                await websocket.send_text(json.dumps({"type": "complete", "content": final_completion_text}))
+                                logger.info("Complete message sent.")
+                            # Handle case where tools were used but no final text was generated
+                            elif final_tool_names_found and not final_completion_text:
+                                 logger.info("Tools used, but no final text found. Sending empty complete message.")
+                                 await websocket.send_text(json.dumps({"type": "complete", "content": ""})) # Send empty complete
+                            # Handle case where absolutely nothing happened
+                            elif not final_completion_text and not final_tool_names_found:
+                                logger.warning("No text response generated AND no tool calls detected.")
+                                await websocket.send_text(json.dumps({
+                                    "type": "error", 
+                                    "content": "Agent produced no response or tool calls."
+                                }))
+                            # ===== End of modified sending logic =====
                                 
                         except asyncio.CancelledError:
                             logger.warning("Stream processing was cancelled")
                             raise
                         except Exception as stream_error:
-                            logger.error(f"Error during stream processing: {stream_error}", exc_info=True)
-                            await websocket.send_text(json.dumps({
-                                "type": "error",
-                                "content": f"Stream error: {str(stream_error)}"
-                            }))
-                    
+                            logger.error(f"Error during agent final text stream processing: {stream_error}", exc_info=True)
+                            error_content = f"Stream processing error: {str(stream_error)}"
+                            # ... (Refine error_content based on model type) ...
+                            await websocket.send_text(json.dumps({"type": "error","content": error_content}))
+                            continue # Skip outer logic if stream errored
+
                 except Exception as agent_error:
                     logger.error(f"Agent error: {agent_error}", exc_info=True)
                     error_message = str(agent_error)
                     
-                    # Special handling for OpenRouter errors
-                    if 'openrouter' in os.getenv('BASE_URL', '').lower():
-                        if 'Insufficient credits' in error_message:
-                            error_message = "OpenRouter error: Insufficient credits. Please add more credits in your OpenRouter account: https://openrouter.ai/settings/credits"
+                    # --- Refine OpenRouter error advice ---
+                    # Only show OpenRouter specific advice if it IS the active model
+                    if isinstance(active_model_instance, OpenRouterModel):
+                        logger.info("Agent error occurred with OpenRouter model active.")
+                        if 'Insufficient credits' in error_message or '402' in error_message:
+                             error_message = "OpenRouter error: Insufficient credits. Please add credits at https://openrouter.ai/settings/credits"
                         elif 'No endpoints found matching your data policy' in error_message:
-                            error_message = "OpenRouter error: Data policy restriction. Please enable prompt training in your OpenRouter settings: https://openrouter.ai/settings/privacy"
+                            error_message = "OpenRouter error: Data policy restriction. Please enable prompt training at https://openrouter.ai/settings/privacy"
                         elif 'Provider returned error' in error_message:
                             advice = ("This error often occurs with non-OpenAI models on OpenRouter. "
                                      "Try using an OpenAI model like 'openai/gpt-3.5-turbo' instead, "
                                      "or leave the model field empty to use OpenRouter's default selection.")
-                            error_message = f"OpenRouter error: {error_message}\n\nSuggestion: {advice}"
-                    
-                    if len(error_message) > 200:
-                        error_message = error_message[:200] + "..."
+                            error_message = f"OpenRouter provider error. Suggestion: {advice}"
+                        # Keep other OpenRouter errors more generic if not recognized
+                        elif not error_message.startswith("OpenRouter error:"): 
+                             error_message = f"OpenRouter agent error: {error_message}"
+                    else:
+                         # Generic error message for non-OpenRouter models
+                         logger.info(f"Agent error occurred with non-OpenRouter model active ({type(active_model_instance).__name__})")
+                         # Shorten potentially long tracebacks or complex errors
+                         if len(error_message) > 300:
+                              error_message = error_message[:300] + "..."
+                         error_message = f"Agent error: {error_message}"
+                    # --- End refinement --- 
+                        
+                    # Send the processed error message
                     await websocket.send_text(json.dumps({
                         "type": "error",
-                        "content": f"Agent error: {error_message}"
+                        "content": error_message 
                     }))
                     
             except json.JSONDecodeError as json_error:

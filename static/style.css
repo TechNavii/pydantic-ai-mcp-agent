@@ -1,0 +1,20 @@
+/* Style for the tool usage message bubble */
+.message.tool-message .message-content {
+    font-style: italic;
+    color: #555;
+}
+
+/* Style for the *post-run* tool usage confirmation message */
+.message.tool-used-message .message-content {
+    font-style: italic;
+    color: #28a745; /* Green color for success indication */
+    font-size: 0.9em;
+    text-align: center;
+    padding: 2px 0;
+}
+
+/* Remove styles for dedicated processing indicator element */
+/*
+#processing-indicator-element { ... }
+#processing-indicator-element.active { ... }
+*/ 
