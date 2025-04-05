@@ -61,7 +61,7 @@ https://github.com/coleam00/ottomator-agents/tree/main/pydantic-ai-mcp-agent
     # Edit mcp_config.json to define your MCP servers/tools
     ```
 
-5.  **(Optional) Configure Initial LLM via `.env`:**
+5.  **Configure Initial LLM via `.env`:**
     - Create a `.env` file in the root directory (or copy `.env.example` if provided).
     - Set `BASE_URL`, `LLM_API_KEY` (leave empty for local models), and `MODEL_CHOICE`. These can also be set via the UI later.
       ```dotenv
