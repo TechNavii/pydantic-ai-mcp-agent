@@ -20,7 +20,7 @@ import mcp_client
 from pydantic_ai import messages as pydantic_messages
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -417,160 +417,163 @@ async def websocket_endpoint(websocket: WebSocket):
                         current_msg_content = str(current_msg_content)
                     
                     logger.debug(f"Current message content: {current_msg_content}")
-                    pydantic_message_history = []
-                    
-                    logger.info("Starting agent.run_stream...")
-                    logger.debug("Preparing run_stream parameters:")
-                    logger.debug(f"  Current message: {json.dumps(current_msg_content, indent=2)}")
-                    logger.debug(f"  Message history length: {len(pydantic_message_history)}")
-                    
-                    # Run the agent with proper message formatting
-                    async with mcp_agent.run_stream(
-                        current_msg_content,  # Pass the content string directly
-                        message_history=pydantic_message_history  # Empty history to avoid errors
-                    ) as result: # result is likely an AgentStream object here
-                        logger.debug("Agent stream context manager entered.")
-                        curr_message = ""
-                        tool_calls_in_run = set() # Reset for each run
-                        try:
-                            logger.info("Accumulating agent final text response via result.stream()...")
-                            # Loop ONLY to get final text, DO NOT send deltas here yet.
-                            async for event in result.stream(): 
-                                if isinstance(event, pydantic_messages.PartDeltaEvent) and isinstance(event.delta, pydantic_messages.TextPartDelta):
-                                    delta = event.delta.content_delta
-                                    if delta:
-                                        curr_message += delta
-                                        # DO NOT send delta here: await websocket.send_text(...)
-                                        
-                            logger.info("Agent final text stream finished accumulating.")
-                            logger.debug(f"Accumulated text length: {len(curr_message)}")
-                            
-                            # ===== Perform history check FIRST =====
-                            logger.info("Performing final checks for tools used.")
-                            final_tool_names_found = set() 
-                            history_to_check = []
-                            if result and hasattr(result, '_all_messages') and isinstance(result._all_messages, list):
-                                history_to_check = result._all_messages
-                                logger.info(f"Using final result._all_messages ({len(history_to_check)} messages) for tool check.")
-                            elif hasattr(mcp_agent, 'messages') and isinstance(mcp_agent.messages, list):
-                                history_to_check = mcp_agent.messages
-                                logger.info(f"Using mcp_agent.messages ({len(history_to_check)} messages) for tool check.")
-                            else:
-                                 logger.warning("Could not access a valid message history list for final tool check.")
-                
-                            if history_to_check:
-                                found_tool_call_in_history = False
-                                logger.info(f"Inspecting history ({len(history_to_check)} messages) for ToolCallParts...")
-                                for msg in history_to_check:
-                                    if isinstance(msg, pydantic_messages.ModelResponse):
-                                         if hasattr(msg, 'parts') and isinstance(msg.parts, list):
-                                             for part in msg.parts:
-                                                 if isinstance(part, pydantic_messages.ToolCallPart):
-                                                      tool_name = getattr(part, 'tool_name', 'unknown_tool')
-                                                      final_tool_names_found.add(tool_name)
-                                                      found_tool_call_in_history = True
-                                if not found_tool_call_in_history:
-                                     logger.info("  No ToolCallPart found in the checked history.")
-                                     
-                            # --- Extract final text response from history if stream was empty ---
-                            final_text_from_history = ""
-                            if not curr_message and history_to_check:
-                                last_message = history_to_check[-1]
-                                if isinstance(last_message, pydantic_messages.ModelResponse):
-                                     if hasattr(last_message, 'parts') and isinstance(last_message.parts, list):
-                                         for part in last_message.parts:
-                                             if isinstance(part, pydantic_messages.TextPart):
-                                                 final_text_from_history = part.content
-                                                 logger.info(f"Found final text in last message history: '{final_text_from_history[:50]}...'")
-                                                 break 
-                                                 
-                            # ===== Send TOOL messages SECOND =====
-                            if final_tool_names_found:
-                                logger.info(f"Sending final tool usage info for: {final_tool_names_found}")
-                                for tool_name in final_tool_names_found:
-                                     logger.info(f"Sending tool_used message for {tool_name} based on final history check.")
-                                     await websocket.send_text(json.dumps({
-                                        "type": "tool_used", 
-                                        "tool_name": tool_name
-                                     }))
-                                     
-                            # ===== Send COMPLETION message THIRD =====
-                            final_completion_text = curr_message if curr_message else final_text_from_history
-                                     
-                            if final_completion_text:
-                                logger.debug(f"Sending final completion text length: {len(final_completion_text)}")
-                                await websocket.send_text(json.dumps({"type": "complete", "content": final_completion_text}))
-                                logger.info("Complete message sent.")
-                            # Handle case where tools were used but no final text was generated
-                            elif final_tool_names_found and not final_completion_text:
-                                 logger.info("Tools used, but no final text found. Sending empty complete message.")
-                                 await websocket.send_text(json.dumps({"type": "complete", "content": ""})) # Send empty complete
-                            # Handle case where absolutely nothing happened
-                            elif not final_completion_text and not final_tool_names_found:
-                                logger.warning("No text response generated AND no tool calls detected.")
-                                await websocket.send_text(json.dumps({
-                                    "type": "error", 
-                                    "content": "Agent produced no response or tool calls."
-                                }))
-                            # ===== End of modified sending logic =====
-                                
-                        except asyncio.CancelledError:
-                            logger.warning("Stream processing was cancelled")
-                            raise
-                        except Exception as stream_error:
-                            logger.error(f"Error during agent final text stream processing: {stream_error}", exc_info=True)
-                            error_content = f"Stream processing error: {str(stream_error)}"
-                            # ... (Refine error_content based on model type) ...
-                            await websocket.send_text(json.dumps({"type": "error","content": error_content}))
-                            continue # Skip outer logic if stream errored
 
-                except Exception as agent_error:
-                    logger.error(f"Agent error: {agent_error}", exc_info=True)
-                    error_message = str(agent_error)
-                    
-                    # --- Refine OpenRouter error advice ---
-                    # Only show OpenRouter specific advice if it IS the active model
-                    if isinstance(active_model_instance, OpenRouterModel):
-                        logger.info("Agent error occurred with OpenRouter model active.")
-                        if 'Insufficient credits' in error_message or '402' in error_message:
-                             error_message = "OpenRouter error: Insufficient credits. Please add credits at https://openrouter.ai/settings/credits"
-                        elif 'No endpoints found matching your data policy' in error_message:
-                            error_message = "OpenRouter error: Data policy restriction. Please enable prompt training at https://openrouter.ai/settings/privacy"
-                        elif 'Provider returned error' in error_message:
-                            advice = ("This error often occurs with non-OpenAI models on OpenRouter. "
-                                     "Try using an OpenAI model like 'openai/gpt-3.5-turbo' instead, "
-                                     "or leave the model field empty to use OpenRouter's default selection.")
-                            error_message = f"OpenRouter provider error. Suggestion: {advice}"
-                        # Keep other OpenRouter errors more generic if not recognized
-                        elif not error_message.startswith("OpenRouter error:"): 
-                             error_message = f"OpenRouter agent error: {error_message}"
-                    else:
-                         # Generic error message for non-OpenRouter models
-                         logger.info(f"Agent error occurred with non-OpenRouter model active ({type(active_model_instance).__name__})")
-                         # Shorten potentially long tracebacks or complex errors
-                         if len(error_message) > 300:
-                              error_message = error_message[:300] + "..."
-                         error_message = f"Agent error: {error_message}"
-                    # --- End refinement --- 
+                    # ===== Execute Agent using agent.run() =====
+                    logger.info("Starting agent.run()...")
+                    agent_run_result: Optional[Any] = None 
+                    final_text_response = ""
+                    final_tool_names_found = set()
+                    agent_history = []
+
+                    try:
+                        agent_run_result = await mcp_agent.run(
+                            current_msg_content, 
+                            message_history=[] # Start fresh each time
+                        )
+                        logger.info("Agent run completed.")
                         
-                    # Send the processed error message
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "content": error_message 
-                    }))
+                        # --- Detailed Inspection of AgentRunResult --- 
+                        if agent_run_result:
+                            logger.info(f"Agent run returned object of type: {type(agent_run_result)}")
+                            
+                            # --- Try extracting text ---
+                            possible_text_attrs = ['output', 'content', 'response']
+                            for attr in possible_text_attrs:
+                                if hasattr(agent_run_result, attr):
+                                    value = getattr(agent_run_result, attr)
+                                    # Check if it's a callable method
+                                    if callable(value):
+                                         try:
+                                             value = value() # Call the method
+                                             logger.debug(f"  Called method result.{attr}()")
+                                         except Exception as call_err:
+                                              logger.warning(f"  Failed to call result.{attr}(): {call_err}")
+                                              value = None
+                                              
+                                    logger.debug(f"  Checking text attribute '{attr}', resolved type: {type(value)}")
+                                    if isinstance(value, str) and value.strip():
+                                        final_text_response = value.strip()
+                                        logger.info(f"  Extracted final text from result.{attr}: '{final_text_response[:100]}...'")
+                                        break
+                            if not final_text_response and isinstance(agent_run_result, str) and agent_run_result.strip():
+                                final_text_response = agent_run_result.strip()
+                                logger.info(f"  Agent run returned string directly: '{final_text_response[:100]}...'")
+
+                            # --- Try extracting history ---
+                            history_attr_found = None
+                            possible_history_attrs = ['all_messages', 'messages', 'history'] # Prioritize all_messages
+                            for attr in possible_history_attrs:
+                                if hasattr(agent_run_result, attr):
+                                     value = getattr(agent_run_result, attr)
+                                     # Check if it's a callable method
+                                     if callable(value):
+                                         try:
+                                             value = value() # Call the method
+                                             logger.debug(f"  Called method result.{attr}()")
+                                         except Exception as call_err:
+                                              logger.warning(f"  Failed to call result.{attr}(): {call_err}")
+                                              value = None
+                                              
+                                     logger.debug(f"  Checking history attribute '{attr}', resolved type: {type(value)}")
+                                     if isinstance(value, list):
+                                         agent_history = value
+                                         history_attr_found = attr
+                                         logger.info(f"  Extracted history from result.{attr} ({len(agent_history)} messages).")
+                                         break
+
+                            if not history_attr_found:
+                                logger.warning("Could not extract message history list from AgentRunResult.")
+
+                            # --- Inspect History Extracted from Result (if found) --- 
+                            if agent_history:
+                                logger.debug(f"--- Inspecting History Extracted from Result (using {history_attr_found}) --- ")
+                                current_run_tool_names = set()
+                                last_text_part_content = "" # Variable to store the latest text part found
+                                
+                                for i, msg in enumerate(agent_history):
+                                    msg_type = type(msg).__name__
+                                    msg_role = getattr(msg, 'role', 'N/A')
+                                    logger.debug(f"  History Msg {i}: Type={msg_type}, Role={msg_role}")
+
+                                    if isinstance(msg, pydantic_messages.ModelResponse):
+                                        if hasattr(msg, 'parts') and isinstance(msg.parts, list):
+                                            for part_idx, part in enumerate(msg.parts):
+                                                part_type = type(part).__name__
+                                                # logger.debug(f"    Part {part_idx}: Type={part_type}") # Verbose
+                                                
+                                                # Find ToolCallParts to identify used tools
+                                                if isinstance(part, pydantic_messages.ToolCallPart):
+                                                    tool_name = getattr(part, 'tool_name', 'unknown_tool')
+                                                    logger.info(f"    ToolCallPart Found: Name={tool_name}")
+                                                    current_run_tool_names.add(tool_name) 
+                                                
+                                                # Find TextPart and store its content, overwriting previous ones
+                                                elif isinstance(part, pydantic_messages.TextPart):
+                                                    if hasattr(part, 'content') and isinstance(part.content, str) and part.content.strip():
+                                                         current_text = part.content.strip()
+                                                         logger.debug(f"    Found TextPart content: '{current_text[:100]}...'")
+                                                         last_text_part_content = current_text # Always store the latest
+                                    
+                                # Assign tools found in this history
+                                final_tool_names_found = current_run_tool_names 
+                                
+                                # Use the last found text part content ONLY if direct extraction failed
+                                if not final_text_response and last_text_part_content:
+                                    final_text_response = last_text_part_content
+                                    logger.info(f"Using text from the *last* TextPart found in history: '{final_text_response[:100]}...'")
+                                    
+                                logger.debug(f"--- Finished Inspecting History from Result (found tools: {final_tool_names_found}) --- ")
+                            else:
+                                # If history couldn't be extracted, log it
+                                logger.warning("No history list was extracted, cannot check for tools or fallback text.")
+
+                        else:
+                            logger.warning("Agent run returned None or empty result.")
+
+                    # ===== Correct position for the except block catching agent run errors =====
+                    except Exception as agent_run_error:
+                         logger.error(f"Error during agent run or result processing: {agent_run_error}", exc_info=True)
+                         await websocket.send_text(json.dumps({"type": "error", "content": f"Error during agent processing: {str(agent_run_error)}"}))
+                         continue # Skip to next websocket message cycle
                     
+                    # ===== Send TOOL Notifications =====
+                    if final_tool_names_found:
+                        logger.info(f"Sending tool usage info: {final_tool_names_found}")
+                        tool_list = sorted(list(final_tool_names_found)) 
+                        for tool_name in tool_list:
+                             logger.info(f"Sending tool_used message for {tool_name}.")
+                             await websocket.send_text(json.dumps({"type": "tool_used", "tool_name": tool_name}))
+
+                    # ===== Send COMPLETION Message =====
+                    final_text_to_send = final_text_response 
+
+                    if final_text_to_send:
+                        logger.debug(f"Sending final completion text length: {len(final_text_to_send)}")
+                        await websocket.send_text(json.dumps({"type": "complete", "content": final_text_to_send}))
+                        logger.info("Complete message sent.")
+                    elif final_tool_names_found and not final_text_to_send:
+                         logger.info("Tools used, but no final text response could be extracted. Sending generic confirmation.")
+                         await websocket.send_text(json.dumps({"type": "complete", "content": "[Tool(s) used successfully.]"})) 
+                    elif not final_tool_names_found and not final_text_to_send:
+                        logger.warning("Agent run produced no text response AND no tool calls detected.")
+                        await websocket.send_text(json.dumps({"type": "error", "content": "Agent produced no response or tool calls."}))
+
+                # ===== Outer error handling for JSON/Parsing errors (ensure correct indentation) =====
+                except json.JSONDecodeError as json_error:
+                    logger.error(f"JSON decode error: {json_error}", exc_info=True)
+                    await websocket.send_text(json.dumps({"type": "error","content": "Invalid message format received"}))
+                    continue # Continue websocket loop
+                except Exception as outer_processing_error: # Catch any other unexpected errors
+                    logger.error(f"Unexpected error in message processing loop: {outer_processing_error}", exc_info=True)
+                    await websocket.send_text(json.dumps({"type": "error","content": f"Unexpected server error: {str(outer_processing_error)}"}))
+                    continue # Continue websocket loop
+            
             except json.JSONDecodeError as json_error:
                 logger.error(f"JSON decode error: {json_error}", exc_info=True)
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "content": "Invalid message format received"
-                }))
-            except Exception as parse_error:
-                logger.error(f"Message parsing error: {parse_error}", exc_info=True)
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "content": f"Failed to process message: {str(parse_error)}"
-                }))
+                await websocket.send_text(json.dumps({"type": "error","content": "Invalid message format received"}))
+            except Exception as parse_error: # Catch any other errors during message processing
+                logger.error(f"Message processing error: {parse_error}", exc_info=True)
+                await websocket.send_text(json.dumps({"type": "error","content": f"Failed to process message: {str(parse_error)}"}))
                 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected normally.")
