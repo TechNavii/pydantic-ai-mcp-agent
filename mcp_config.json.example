@@ -9,6 +9,17 @@
         "env": {
           "BRAVE_API_KEY": "BRAVE_API_KEY"
         }
+      },
+      "slack": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-slack"
+      ],
+      "env": {
+        "SLACK_BOT_TOKEN": "BOT-TOKEN",
+        "SLACK_TEAM_ID": "TEAM-ID"
       }
+     }
     }
-  }
+}
