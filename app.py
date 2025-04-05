@@ -15,6 +15,7 @@ from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.gemini import GeminiModel
+from pydantic_ai import exceptions  # Add the exceptions import
 import mcp_client
 from pydantic_ai import messages as pydantic_messages
 
