@@ -396,15 +396,19 @@ def get_model() -> Union[OpenAIModel, AnthropicModel, GeminiModel, OpenRouterMod
     
     # Default to standard OpenAI model
     else:
+        # Check if API key is effectively empty
+        api_key_value = os.getenv('LLM_API_KEY', '') # Default to empty string
+        key_to_pass = api_key_value if api_key_value else None
+        
         if not base_url or not base_url.startswith('http'):
              logger.warning(f"Invalid or empty BASE_URL provided: '{base_url}'. Falling back to default OpenAI URL.")
              base_url = 'https://api.openai.com/v1' # Default OpenAI URL
 
-        logger.info(f"Defaulting to standard OpenAI model for base URL: {base_url}")
+        logger.info(f"Defaulting to standard OpenAI model for base URL: {base_url}. API Key Provided: {bool(key_to_pass)}")
         return OpenAIModel(
             llm,
             base_url=base_url,
-            api_key=api_key
+            api_key=key_to_pass # Pass None if key was empty
         )
 
 async def get_pydantic_ai_agent() -> tuple[mcp_client.MCPClient, Agent]:
