@@ -712,3 +712,36 @@ button:disabled {
         width: 100%;
     }
 }
+
+/* ========================================================================== */
+/* Tool Usage Message Styles (from style.css) */
+/* ========================================================================== */
+
+/* Style for the tool usage message bubble */
+.message.tool-message .message-content {
+    font-style: italic;
+    color: #555;
+}
+
+/* Style for the *post-run* tool usage confirmation message */
+.message.tool-used-message .message-content {
+    font-style: italic;
+    color: #28a745; /* Green color for success indication */
+    font-size: 0.9em;
+    text-align: center;
+    padding: 2px 0;
+}
+
+/* Add styles for system messages used for tool notifications */
+.message.system {
+    font-style: italic;
+    font-size: 0.9em;
+    padding: 0.5rem 0.75rem;
+}
+
+/* Style success indicators in system messages (e.g., ✅) */
+.message.system .message-content span.success-icon,
+.message.system .message-content span[role="img"] {
+    color: var(--success-color);
+    margin-right: 4px;
+}
