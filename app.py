@@ -431,7 +431,11 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection accepted.")
     mcp_agent_client: Optional[mcp_client.MCPClient] = None
-    active_model_instance = None # Store the instantiated model
+    active_model_instance = None 
+    
+    # --- Initialize session history --- 
+    session_history = []
+    MAX_HISTORY_MSGS = 50 # Max number of messages (turns) to keep
     
     try:
         # Modify agent initialization to store the model instance
@@ -476,7 +480,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 # Process the message using Pydantic AI agent
                 try:
-                    # Get the content of the current message as a string
                     current_msg_content = request.message
                     if isinstance(current_msg_content, dict) and 'content' in current_msg_content:
                         current_msg_content = current_msg_content['content']
@@ -485,143 +488,158 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     logger.debug(f"Current message content: {current_msg_content}")
 
+                    # --- Add user message (temporary, will be replaced by ModelRequest) ---
+                    # We still need to track the user's input content for identifying the ModelRequest later
+                    current_user_input_content = current_msg_content # Store for comparison
+
+                    # --- Prepare history for agent.run() ---
+                    # History should contain ModelRequest/ModelResponse objects from previous turns
+                    history_to_pass = list(session_history) # Pass the current history objects
+                    logger.debug(f"Session history size before agent run: {len(history_to_pass)}")
+                    logger.debug(f"Passing history to agent.run: {[type(m).__name__ for m in history_to_pass]}")
+
                     # ===== Execute Agent using agent.run() =====
-                    logger.info("Starting agent.run()...")
-                    agent_run_result: Optional[Any] = None 
+                    logger.info("Reverting to agent.run() to avoid stream hang...")
+                    agent_run_result: Optional[Any] = None
                     final_text_response = ""
                     final_tool_names_found = set()
-                    agent_history = []
+                    agent_history_this_run = [] # To store messages from this run
 
                     try:
+                        # Use agent.run() again
+                        logger.debug(f"Calling agent.run with prompt: '{current_user_input_content[:100]}...' and history ({len(history_to_pass)} messages)")
                         agent_run_result = await mcp_agent.run(
-                            current_msg_content, 
-                            message_history=[] # Start fresh each time
+                            current_user_input_content,    # Positional argument: user_prompt
+                            message_history=history_to_pass # Keyword argument: history OBJECTS from previous turns
                         )
                         logger.info("Agent run completed.")
-                        
-                        # --- Detailed Inspection of AgentRunResult --- 
-                        if agent_run_result:
-                            logger.info(f"Agent run returned object of type: {type(agent_run_result)}")
+
+                        # --- Extract history from this run ---
+                        if agent_run_result and hasattr(agent_run_result, 'all_messages') and callable(agent_run_result.all_messages):
+                             agent_history_this_run = agent_run_result.all_messages()
+                             logger.info(f"Extracted {len(agent_history_this_run)} messages from agent_run result.")
+                        else:
+                             logger.warning("Could not extract message history (all_messages) from agent run result.")
+
+                        # --- Process the extracted history from THIS run --- 
+                        if agent_history_this_run:
+                            logger.debug(f"--- Inspecting History from Run Result ({len(agent_history_this_run)} messages) --- ")
+                            # Logging loop (keep detailed logging):
+                            for i, msg_obj in enumerate(agent_history_this_run):
+                                try:
+                                     logger.debug(f"  Raw History Msg {i}: Type={type(msg_obj).__name__}, repr={repr(msg_obj)}")
+                                except Exception as log_err:
+                                     logger.error(f"Error logging details for History Msg {i}: {log_err}")
                             
-                            # --- Try extracting text ---
-                            possible_text_attrs = ['output', 'content', 'response']
-                            for attr in possible_text_attrs:
-                                if hasattr(agent_run_result, attr):
-                                    value = getattr(agent_run_result, attr)
-                                    # Check if it's a callable method
-                                    if callable(value):
-                                         try:
-                                             value = value() # Call the method
-                                             logger.debug(f"  Called method result.{attr}()")
-                                         except Exception as call_err:
-                                              logger.warning(f"  Failed to call result.{attr}(): {call_err}")
-                                              value = None
-                                              
-                                    logger.debug(f"  Checking text attribute '{attr}', resolved type: {type(value)}")
-                                    if isinstance(value, str) and value.strip():
-                                        final_text_response = value.strip()
-                                        logger.info(f"  Extracted final text from result.{attr}: '{final_text_response[:100]}...'")
-                                        break
-                            if not final_text_response and isinstance(agent_run_result, str) and agent_run_result.strip():
-                                final_text_response = agent_run_result.strip()
-                                logger.info(f"  Agent run returned string directly: '{final_text_response[:100]}...'")
+                            # Reset variables for this run
+                            current_run_tool_names = set()
+                            final_text_response = ""
 
-                            # --- Try extracting history ---
-                            history_attr_found = None
-                            possible_history_attrs = ['all_messages', 'messages', 'history'] # Prioritize all_messages
-                            for attr in possible_history_attrs:
-                                if hasattr(agent_run_result, attr):
-                                     value = getattr(agent_run_result, attr)
-                                     # Check if it's a callable method
-                                     if callable(value):
-                                         try:
-                                             value = value() # Call the method
-                                             logger.debug(f"  Called method result.{attr}()")
-                                         except Exception as call_err:
-                                              logger.warning(f"  Failed to call result.{attr}(): {call_err}")
-                                              value = None
-                                              
-                                     logger.debug(f"  Checking history attribute '{attr}', resolved type: {type(value)}")
-                                     if isinstance(value, list):
-                                         agent_history = value
-                                         history_attr_found = attr
-                                         logger.info(f"  Extracted history from result.{attr} ({len(agent_history)} messages).")
-                                         break
-
-                            if not history_attr_found:
-                                logger.warning("Could not extract message history list from AgentRunResult.")
-
-                            # --- Inspect History Extracted from Result (if found) --- 
-                            if agent_history:
-                                logger.debug(f"--- Inspecting History Extracted from Result (using {history_attr_found}) --- ")
-                                current_run_tool_names = set()
-                                last_text_part_content = "" # Variable to store the latest text part found
-                                
-                                for i, msg in enumerate(agent_history):
-                                    msg_type = type(msg).__name__
-                                    msg_role = getattr(msg, 'role', 'N/A')
-                                    logger.debug(f"  History Msg {i}: Type={msg_type}, Role={msg_role}")
-
-                                    if isinstance(msg, pydantic_messages.ModelResponse):
-                                        if hasattr(msg, 'parts') and isinstance(msg.parts, list):
-                                            for part_idx, part in enumerate(msg.parts):
-                                                part_type = type(part).__name__
-                                                # logger.debug(f"    Part {part_idx}: Type={part_type}") # Verbose
-                                                
-                                                # Find ToolCallParts to identify used tools
-                                                if isinstance(part, pydantic_messages.ToolCallPart):
-                                                    tool_name = getattr(part, 'tool_name', 'unknown_tool')
-                                                    logger.info(f"    ToolCallPart Found: Name={tool_name}")
-                                                    current_run_tool_names.add(tool_name) 
-                                                
-                                                # Find TextPart and store its content, overwriting previous ones
-                                                elif isinstance(part, pydantic_messages.TextPart):
-                                                    if hasattr(part, 'content') and isinstance(part.content, str) and part.content.strip():
-                                                         current_text = part.content.strip()
-                                                         logger.debug(f"    Found TextPart content: '{current_text[:100]}...'")
-                                                         last_text_part_content = current_text # Always store the latest
-                                    
-                                # Assign tools found in this history
-                                final_tool_names_found = current_run_tool_names 
-                                
-                                # Use the last found text part content ONLY if direct extraction failed
-                                if not final_text_response and last_text_part_content:
-                                    final_text_response = last_text_part_content
-                                    logger.info(f"Using text from the *last* TextPart found in history: '{final_text_response[:100]}...'")
-                                    
-                                logger.debug(f"--- Finished Inspecting History from Result (found tools: {final_tool_names_found}) --- ")
+                            # Find the LAST ModelResponse for the final text output
+                            last_response_obj_this_run = None
+                            for msg in reversed(agent_history_this_run):
+                                if isinstance(msg, pydantic_messages.ModelResponse):
+                                     last_response_obj_this_run = msg
+                                     break
+                            
+                            # Extract final text from the LAST response
+                            if last_response_obj_this_run:
+                                logger.info("Extracting final text from last ModelResponse...")
+                                if hasattr(last_response_obj_this_run, 'parts') and isinstance(last_response_obj_this_run.parts, list):
+                                    for part in last_response_obj_this_run.parts:
+                                        if isinstance(part, pydantic_messages.TextPart):
+                                            if hasattr(part, 'content') and isinstance(part.content, str) and part.content.strip():
+                                                 final_text_response = part.content.strip()
+                                                 logger.info(f"Using final text from last response: '{final_text_response[:100]}...'")
+                                                 break # Found text in last response
+                                         # Don't extract tools here, do it in the next loop
                             else:
-                                # If history couldn't be extracted, log it
-                                logger.warning("No history list was extracted, cannot check for tools or fallback text.")
+                                # This might happen if the run failed before generating a final response
+                                logger.warning("No final ModelResponse object found in the history from this run.")
+                            
+                            # Extract tool calls from ALL ModelResponses in this run
+                            logger.info("Extracting tool calls from ALL ModelResponses in this run...")
+                            for msg in agent_history_this_run:
+                                if isinstance(msg, pydantic_messages.ModelResponse):
+                                    if hasattr(msg, 'parts') and isinstance(msg.parts, list):
+                                        for part in msg.parts:
+                                            if isinstance(part, pydantic_messages.ToolCallPart):
+                                                tool_name = getattr(part, 'tool_name', 'unknown_tool')
+                                                logger.info(f"    ToolCallPart Found in a ModelResponse: Name={tool_name}")
+                                                current_run_tool_names.add(tool_name)
+
+                            final_tool_names_found = current_run_tool_names
+                            logger.debug(f"--- Finished Inspecting History from Result --- ")
+
+                            # --- Update Session History (Append Request/Last Response) --- 
+                            request_obj_this_run = None
+                            response_obj_this_run = None 
+                            for msg in reversed(agent_history_this_run):
+                                if isinstance(msg, pydantic_messages.ModelResponse):
+                                     response_obj_this_run = msg
+                                     break
+                            for msg in agent_history_this_run:
+                                if hasattr(msg, 'parts') and isinstance(msg.parts, list) and msg.parts:
+                                     first_part = msg.parts[0]
+                                     if isinstance(first_part, pydantic_messages.UserPromptPart) and \
+                                        getattr(first_part, 'content', None) == current_user_input_content:
+                                         request_obj_this_run = msg
+                                         logger.debug("Identified initial ModelRequest object for this run.")
+                                         break # Found it
+                                elif hasattr(msg, 'prompt'): # Fallback check, might catch other request types
+                                     prompt_attr = getattr(msg, 'prompt')
+                                     if isinstance(prompt_attr, pydantic_messages.Prompt) and \
+                                        getattr(prompt_attr, 'input', None) == current_user_input_content:
+                                         request_obj_this_run = msg
+                                         logger.debug("Identified ModelRequest (fallback check) object for this run.")
+                                         break # Found it
+                            logger.debug(f"Updating persistent session_history by appending objects from this run.")
+                            if request_obj_this_run:
+                                session_history.append(request_obj_this_run)
+                            else:
+                                logger.warning("Could not reliably identify ModelRequest object to add to session history.")
+                                
+                            if response_obj_this_run:
+                                session_history.append(response_obj_this_run)
+                            else:
+                                # This warning is expected if the run only contained the request (e.g., error before response)
+                                logger.warning("No ModelResponse object found in this run to add to session history.")
+
+                            # Ensure history doesn't exceed max size
+                            if len(session_history) > MAX_HISTORY_MSGS:
+                                session_history = session_history[-MAX_HISTORY_MSGS:]
+                            logger.debug(f"Session history size after update: {len(session_history)}")
+                            logger.debug(f"Final session_history content types: {[type(m).__name__ for m in session_history]}")
 
                         else:
-                            logger.warning("Agent run returned None or empty result.")
+                             # This case means agent.run finished but all_messages was empty or missing
+                             logger.error("Agent run finished but result contained no messages (all_messages). Cannot update history or get response.")
+                             final_text_response = "" 
+                             final_tool_names_found = set()
 
-                    # ===== Correct position for the except block catching agent run errors =====
+                    # ===== Error handling for agent.run() =====
                     except Exception as agent_run_error:
-                         logger.error(f"Error during agent run or result processing: {agent_run_error}", exc_info=True)
+                         logger.error(f"Error during agent.run() or result processing: {agent_run_error}", exc_info=True)
+                         # History update logic assumes success, so no specific cleanup needed here
                          await websocket.send_text(json.dumps({"type": "error", "content": f"Error during agent processing: {str(agent_run_error)}"}))
-                         continue # Skip to next websocket message cycle
-                    
-                    # ===== Send TOOL Notifications =====
+                         continue 
+
+                    # ===== Send TOOL Notifications / COMPLETION Message =====
                     if final_tool_names_found:
                         logger.info(f"Sending tool usage info: {final_tool_names_found}")
-                        tool_list = sorted(list(final_tool_names_found)) 
+                        tool_list = sorted(list(final_tool_names_found))
                         for tool_name in tool_list:
                              logger.info(f"Sending tool_used message for {tool_name}.")
                              await websocket.send_text(json.dumps({"type": "tool_used", "tool_name": tool_name}))
 
-                    # ===== Send COMPLETION Message =====
-                    final_text_to_send = final_text_response 
-
-                    if final_text_to_send:
-                        logger.debug(f"Sending final completion text length: {len(final_text_to_send)}")
-                        await websocket.send_text(json.dumps({"type": "complete", "content": final_text_to_send}))
+                    if final_text_response:
+                        logger.debug(f"Sending final completion text length: {len(final_text_response)}")
+                        await websocket.send_text(json.dumps({"type": "complete", "content": final_text_response}))
                         logger.info("Complete message sent.")
-                    elif final_tool_names_found and not final_text_to_send:
+                    elif final_tool_names_found and not final_text_response:
                          logger.info("Tools used, but no final text response could be extracted. Sending generic confirmation.")
-                         await websocket.send_text(json.dumps({"type": "complete", "content": "[Tool(s) used successfully.]"})) 
-                    elif not final_tool_names_found and not final_text_to_send:
+                         await websocket.send_text(json.dumps({"type": "complete", "content": "[Tool(s) used successfully.]"}))
+                    elif not final_tool_names_found and not final_text_response:
                         logger.warning("Agent run produced no text response AND no tool calls detected.")
                         await websocket.send_text(json.dumps({"type": "error", "content": "Agent produced no response or tool calls."}))
 
