@@ -59,6 +59,8 @@ https://github.com/coleam00/ottomator-agents/tree/main/pydantic-ai-mcp-agent
     ```bash
     cp mcp_config.json.example mcp_config.json
     # Edit mcp_config.json to define your MCP servers/tools
+    cp .env.example .env
+    # Edit .env.example to define your environment variables
     ```
 
 5.  **Configure Initial LLM via `.env`:**
